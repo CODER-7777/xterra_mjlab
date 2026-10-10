@@ -85,6 +85,9 @@ class Adapter:
         if self.numerical_guard and not torch.isfinite(actions).all():
             raise FloatingPointError("Non-finite action before simulator step")
         obs, rewards, terminated, truncated, extras = self.env.step(actions.clamp(-6., 6.))
+        reward_term_rates = (
+            self.env.reward_manager._step_reward.detach().mean(dim=0)
+        )
         invalid = torch.zeros_like(terminated)
         if self.numerical_guard:
             invalid = (~torch.isfinite(obs["actor"]).all(1)
@@ -114,6 +117,7 @@ class Adapter:
         done = done.clone()
         truncated = truncated.clone()
         info = dict(extras)
+        info["reward_term_rates"] = reward_term_rates
         info["terminal_events"] = terminated.float().sum()
         info["finished_episodes"] = done.float().sum()
         info["finished_episode_seconds"] = (self.env.episode_length_buf * done).sum()*self.env.step_dt

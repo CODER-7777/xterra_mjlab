@@ -122,7 +122,12 @@ def svanm2_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     joint_pos_action = cfg.actions["joint_pos"]
     assert isinstance(joint_pos_action, JointPositionActionCfg)
     joint_pos_action.scale = SVANM2_ACTION_SCALE
-
+    joint_pos_action.clip={
+        r".*_hip_joint":(-0.735,0.735),
+        r".*F[LR]_thigh_joint":(-1.5708,3.4907),
+        r".*R[LR]_thigh_joint":(-0.5236,4.5379),
+        r".*_calf_joint":(-2.7227,-0.88776),
+    }
     cfg.viewer.body_name = "base"
     cfg.viewer.distance = 2.0
     cfg.viewer.elevation = -10.0
@@ -234,6 +239,7 @@ def svanm2_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.rewards["track_linear_velocity"].params["std"] = math.sqrt(0.25)
     cfg.rewards["track_angular_velocity"].weight = 3.0
     cfg.rewards["track_angular_velocity"].params["std"] = math.sqrt(0.5)
+    cfg.rewards["action_rate_l2"].weight = -0.15
 
     cfg.rewards["upright"].weight = 0.5
     cfg.rewards["upright"].params["asset_cfg"].body_names = ("base",)

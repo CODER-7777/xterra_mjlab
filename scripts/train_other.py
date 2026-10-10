@@ -3,6 +3,7 @@ import argparse
 from dataclasses import asdict
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -15,9 +16,46 @@ from torch.utils.tensorboard import SummaryWriter
 from mjlab.utils.os import dump_yaml
 from xterra_mjlab.assets.svanm2.constants import SVANM2_XML
 from m2_algorithm_env import Adapter, make_cfg
+from jitter_rewards import config_jitter_rewards
+from target_rate_reward import configure_target_rate_trial
 from other_backends import load
 from train_him import write
 from training_recovery import restore, install_optimizer_guards, timeout_bootstrap, require_finite
+
+
+def configure_training_rewards(cfg, algorithm, action_rate_weight=None,
+                               target_rate_weight=None,
+                               target_rate_limits=(7.093, 11.275, 20.365),
+                               target_limit_profile="existing", swing_height=None):
+    """Configure before saving YAML/constructing the environment; preserve baseline."""
+    if target_limit_profile not in ("existing", "viewer-wide"):
+        raise ValueError("Unknown target-limit profile")
+    if target_limit_profile == "viewer-wide":
+        if algorithm != "moe":
+            raise ValueError("The viewer-wide profile is supported only for MoE")
+        # Explicit simulation trial matching the user's successful viewer run.
+        # Keep asymmetric thigh bounds, scales, history and actuator gains.
+        cfg.actions["joint_pos"].clip[r".*_hip_joint"] = (-1.0472, 1.0472)
+        cfg.actions["joint_pos"].clip[r".*_calf_joint"] = (-2.7227, .5)
+    if algorithm == "moe":
+        cfg = config_jitter_rewards(cfg)
+        if target_rate_weight is not None:
+            if len(target_rate_limits) != 3:
+                raise ValueError("Supply HIP THIGH CALF target-rate thresholds in rad/s")
+            cfg = configure_target_rate_trial(cfg, list(target_rate_limits) * 4,
+                weight=target_rate_weight, replace_second_difference=False)
+        if action_rate_weight is not None:
+            cfg.rewards["action_rate_l2"].weight = action_rate_weight
+    elif target_rate_weight is not None:
+        raise ValueError("--target-rate-weight is supported only for MoE")
+    if swing_height is not None:
+        if algorithm != "moe" or not math.isfinite(swing_height) or swing_height <= 0:
+            raise ValueError("Use a positive finite MoE swing-height preference in metres")
+        # These existing terms retain their command gating and weights.
+        # This is terrain-relative foot-site clearance, not world foot height.
+        for name in ("foot_clearance", "foot_swing_height"):
+            cfg.rewards[name].params["target_height"] = swing_height
+    return cfg
 
 
 def main():
@@ -35,13 +73,40 @@ def main():
     p.add_argument("--max-learning-rate", type=float, default=3e-4)
     p.add_argument("--std-min", type=float, default=.05)
     p.add_argument("--std-max", type=float, default=1.)
+    p.add_argument("--action-rate-weight", type=float, default=None)
+    p.add_argument("--target-rate-weight", type=float, default=None,
+        help="Enable MoE time-aware target-rate excess penalty with this negative weight")
+    p.add_argument("--target-rate-limits", type=float, nargs=3,
+        metavar=("HIP", "THIGH", "CALF"), default=(7.093, 11.275, 20.365),
+        help="Exploratory target-rate thresholds in rad/s, repeated for all four legs")
+    p.add_argument("--target-limit-profile", choices=("existing", "viewer-wide"), default="existing",
+        help="Keep training bounds, or explicitly match the wider simulation viewer bounds")
+    p.add_argument("--swing-height", type=float, default=None,
+        help="MoE terrain-relative foot-height preference in metres for both existing clearance terms")
     a = p.parse_args()
+    if a.algorithm != "moe" and a.target_rate_weight is not None:
+        p.error("--target-rate-weight is supported only for --algorithm moe")
     torch.set_num_threads(int(os.environ.get("M2_TORCH_THREADS", "6")))
     torch.manual_seed(a.seed)
     np.random.seed(a.seed)
     random.seed(a.seed)
     device = "cuda:0"
     cfg = make_cfg(a.num_envs, a.seed)
+    cfg = configure_training_rewards(cfg, a.algorithm, a.action_rate_weight,
+        a.target_rate_weight, a.target_rate_limits, a.target_limit_profile, a.swing_height)
+    if a.swing_height is not None:
+        print("SWING_HEIGHT_REWARD", json.dumps(dict(target_height_m=a.swing_height,
+            weights={name: cfg.rewards[name].weight
+                     for name in ("foot_clearance", "foot_swing_height")})), flush=True)
+    if a.target_limit_profile != "existing":
+        print("TARGET_LIMIT_PROFILE", json.dumps(dict(profile=a.target_limit_profile,
+            bounds=cfg.actions["joint_pos"].clip)), flush=True)
+    if a.target_rate_weight is not None:
+        print("TARGET_RATE_REWARD", json.dumps(dict(weight=a.target_rate_weight,
+            thresholds_rad_s=list(a.target_rate_limits),
+            policy_step_s=cfg.sim.mujoco.timestep * cfg.decimation,
+            second_difference_weight=cfg.rewards["target_second_difference_l2"].weight,
+            saturation_weight=cfg.rewards["target_saturation_l2"].weight)), flush=True)
     if a.smoke:
         cfg.episode_length_s = .20
     wtw = a.algorithm == "wtw"
@@ -77,6 +142,9 @@ def main():
     write(a.out/"source_hashes.json", {str(f.relative_to(a.source)): hashlib.sha256(f.read_bytes()).hexdigest()
           for f in a.source.rglob("*.py")})
     adapter = Adapter(cfg, device, history=history_length, frame_size=frame_size, numerical_guard=a.stabilize)
+    reward_names = list(adapter.env.reward_manager.active_terms)
+    if adapter.env.reward_manager._step_reward.shape != (a.num_envs, len(reward_names)):
+        raise RuntimeError("Unexpected reward buffer layout; inspect installed mjlab")
     Model, Algorithm = load(a.source, a.algorithm)
     if wtw:
         model = Model(frame_size, 2, frame_size*history_length, 12).to(device)
@@ -129,6 +197,7 @@ def main():
     for update in range(completed+1, a.updates+1):
         tick = time.monotonic()
         episode_stats = torch.zeros(3, device=device)
+        reward_rate_sum = torch.zeros(len(reward_names), device=device)
         with torch.no_grad():
             for _ in range(a.steps):
                 history = adapter.history.flip(1).flatten(1)
@@ -137,6 +206,7 @@ def main():
                 action = alg.act(current, privileged, history)
                 old_history = adapter.history
                 rewards, done, info, successor = adapter.step(action)
+                reward_rate_sum += info.pop("reward_term_rates")
                 episode_stats += torch.stack([info[k] for k in
                     ("terminal_events", "finished_episodes", "finished_episode_seconds")])
                 timeout = info.pop("time_outs")
@@ -177,6 +247,16 @@ def main():
         for index, loss in enumerate(losses):
             writer.add_scalar(f"Loss/{index}", loss, update)
         writer.add_scalar("Terrain/mean", result["mean_terrain_level"], update)
+        mean_rates = (reward_rate_sum / a.steps).cpu().tolist()
+        for name, weighted_rate in zip(reward_names, mean_rates):
+            writer.add_scalar(f"RewardRate/{name}", weighted_rate, update)
+            weight = adapter.env.reward_manager.get_term_cfg(name).weight
+            if weight != 0:
+                writer.add_scalar(
+                    f"RewardRaw/{name}",
+                    weighted_rate / weight,
+                    update,
+                )
         if update % 100 == 0 or update == a.updates:
             checkpoint = dict(model_state_dict=model.state_dict(),
                 optimizer_states=[o.state_dict() for o in optimizers], update=update,

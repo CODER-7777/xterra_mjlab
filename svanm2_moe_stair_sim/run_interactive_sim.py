@@ -23,15 +23,24 @@ sys.path.insert(0, str(HERE))
 
 from build_scene import build_scene_xml, TRACK_CONFIGS, TRACK_SPACING
 from controller import MoeStairController
+from checkpoint_policy import DEFAULT_CHECKPOINT
 from teleop import KeyboardTeleop, MAX_VX, MAX_VY, MAX_YAW
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="SvanM2 MoE 90k Interactive Stair Simulation")
+    parser.add_argument("--checkpoint-file", type=Path, default=DEFAULT_CHECKPOINT,
+                        help="MoE-CTS training checkpoint (default: checkpoints/svanm2_moe/model_90000.pt)")
+    parser.add_argument("--device", default="cuda:0",
+                        help="Policy inference device: cuda:0 (default) or cpu; MuJoCo physics remains on CPU")
     parser.add_argument("--track", type=int, default=1, choices=[1, 2, 3, 4, 5, 6],
                         help="Initial track number (1: 10cm, 2: 12cm, 3: 14cm, 4: 15cm, 5: 16cm, 6: 20cm)")
     parser.add_argument("--top", action="store_true", help="Spawn directly on the top platform")
     parser.add_argument("--rebuild-scene", action="store_true", help="Force rebuild of scene.xml")
+    parser.add_argument("--record", action="store_true", help="Log your actual interactive run to tools/results/interactive/<timestamp>")
+    parser.add_argument("--observation-timing", choices=("legacy", "fresh"), default="legacy",
+                        help="Legacy readings or consistent post-step readings refreshed on copied state")
+    parser.add_argument("--log-dir", type=Path, help="Record to this new directory instead of an automatic timestamp")
     return parser.parse_args()
 
 
@@ -60,14 +69,23 @@ def main():
     data = mujoco.MjData(model)
 
     print("[INFO] Initializing MoE 90k Controller and Teleop...")
-    ctrl = MoeStairController(model, data)
-    teleop = KeyboardTeleop(ctrl, TRACK_CONFIGS, track_spacing=TRACK_SPACING)
+    ctrl = MoeStairController(model, data, checkpoint_path=args.checkpoint_file, device=args.device,
+                             observation_timing=args.observation_timing)
+    session = None
+    if args.record or args.log_dir:
+        sys.path.insert(0, str(HERE.parents[1] / "tools/jitter_analysis"))
+        from interactive import InteractiveSession, RecordedTeleop
+        teleop = RecordedTeleop(ctrl, TRACK_CONFIGS, track_spacing=TRACK_SPACING)
+    else:
+        teleop = KeyboardTeleop(ctrl, TRACK_CONFIGS, track_spacing=TRACK_SPACING)
 
     # Spawn at requested track
     teleop.teleport_to_track(args.track, on_top=args.top)
+    if args.record or args.log_dir:
+        session = InteractiveSession(model, data, ctrl, teleop, args.log_dir)
 
     print("\n" + "="*80)
-    print(" SVAN M2 — MOE 90,000 POLICY MULTI-STAIR INTERACTIVE SIMULATION")
+    print(f" SVAN M2 — MOE UPDATE {ctrl.checkpoint_update} MULTI-STAIR INTERACTIVE SIMULATION")
     print("="*80)
     print(" Tracks: [1] 10cm  [2] 12cm  [3] 14cm  [4] 15cm  [5] 16cm  [6] 20cm (12 steps each)")
     print("\n CONTROLS:")
@@ -93,6 +111,7 @@ def main():
     # Start non-blocking terminal input listener
     teleop.start_terminal_listener()
 
+    error = None
     try:
         # Launch passive viewer
         with mujoco.viewer.launch_passive(model, data, key_callback=teleop.handle_key) as viewer:
@@ -109,6 +128,8 @@ def main():
             sim_start = data.time
 
             while viewer.is_running():
+                if session:
+                    teleop.apply_pending(session)
                 # Prevent MuJoCo hotkey toggles from corrupting the visual rendering
                 viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_ACTUATOR] = 0
                 viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_LIGHT] = 0
@@ -118,11 +139,19 @@ def main():
                     viewer.user_scn.flags[mujoco.mjtRndFlag.mjRND_WIREFRAME] = 0
 
                 # Policy step at 50 Hz
-                if step % decimation == 0:
-                    ctrl.policy_step(command=teleop.command)
+                policy_tick = step % decimation == 0
+                command = teleop.command
+                if session:
+                    session.prepare_policy(command, policy_tick)
+                if policy_tick:
+                    ctrl.policy_step(command=command)
 
                 # Physics step at 200 Hz
+                if session:
+                    session.before_physics(command, teleop.current_track)
                 ctrl.physics_step()
+                if session:
+                    session.after_physics()
                 step += 1
 
                 # Calculate base tilt
@@ -157,8 +186,13 @@ def main():
 
     except KeyboardInterrupt:
         print("\n[INFO] Simulation stopped by user.")
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        raise
     finally:
         teleop.stop_terminal_listener()
+        if session:
+            session.close(error)
 
     print("\n[INFO] Viewer closed.")
 

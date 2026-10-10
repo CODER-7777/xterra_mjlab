@@ -1,38 +1,18 @@
 """MoE 90k policy controller and actuator PD driver for SvanM2 in MuJoCo.
 
-Matches the hardware transfer specification:
-- Checkpoint: model_90000.pt / offline_inference.ts
+Simulator policy/control contract (hardware limits/gains require separate validation):
+- Checkpoint: model_90000.pt (loaded directly)
 - 5-frame x 45-dim history buffer (oldest-first into student network)
 - Action scaling [0.15, 0.15, 0.30] with joint limit clamping
 - Coupled belt-drive PD torque model (kp=20.0, kd=0.7, gear=[8,8,16])
 - Policy at 50 Hz, physics at 200 Hz (decimation 4)
 """
 
-import json
 from pathlib import Path
 import numpy as np
 import torch
 import mujoco
-
-HERE = Path(__file__).resolve().parent
-
-def find_policy_path() -> Path:
-    candidates = [
-        HERE.parent / "checkpoints/svanm2_moe/offline_inference.ts",
-        HERE / "../checkpoints/svanm2_moe/offline_inference.ts",
-        HERE.parent / "m2_training_artifacts/moe_hw_candidate_90000/offline_inference.ts",
-        HERE.parent.parent / "m2_training_artifacts/moe_hw_candidate_90000/offline_inference.ts",
-    ]
-    for c in candidates:
-        try:
-            resolved = c.resolve()
-            if resolved.exists():
-                return resolved
-        except Exception:
-            continue
-    raise FileNotFoundError("Could not find offline_inference.ts in checkpoints/svanm2_moe/")
-
-POLICY_PATH = find_policy_path()
+from checkpoint_policy import DEFAULT_CHECKPOINT, load_checkpoint_policy
 
 JOINTS = [f"{leg}_{stage}_joint" for leg in ("FL", "FR", "RL", "RR") for stage in ("hip", "thigh", "calf")]
 Q0 = np.array([0., 0.5806, -1.1716, 0., 0.5806, -1.1716, 0., 0.7167, -1.1342, 0., 0.7167, -1.1342], dtype=np.float32)
@@ -50,10 +30,10 @@ TARGET_MIN = np.array([
 ], dtype=np.float32)
 
 TARGET_MAX = np.array([
-     1.0472,  3.4907,  0.5000,  # FL
-     1.0472,  3.4907,  0.5000,  # FR
-     1.0472,  4.5379,  0.5000,  # RL
-     1.0472,  4.5379,  0.5000   # RR
+     1.0472,  3.4907, 0.5000,  # FL
+     1.0472,  3.4907, 0.5000,  # FR
+     1.0472,  4.5379, 0.5000,  # RL
+     1.0472,  4.5379, 0.5000   # RR
 ], dtype=np.float32)
 
 # Belt coupling Jacobian (4 legs, 3x3 block diagonal)
@@ -64,13 +44,26 @@ J_COUPLING = np.kron(np.eye(4, dtype=np.float32), J_LEG)
 
 
 class MoeStairController:
-    def __init__(self, model: mujoco.MjModel, data: mujoco.MjData):
+    def __init__(self, model: mujoco.MjModel, data: mujoco.MjData,
+                 checkpoint_path: Path = DEFAULT_CHECKPOINT, device: str = "cpu",
+                 observation_timing: str = "legacy"):
         self.model = model
         self.data = data
+        if observation_timing not in ("legacy", "fresh"):
+            raise ValueError("observation_timing must be legacy or fresh")
+        self.observation_timing = observation_timing
+        self.observation_data = mujoco.MjData(model) if observation_timing == "fresh" else None
 
-        # Load TorchScript model
-        assert POLICY_PATH.exists(), f"Policy missing at {POLICY_PATH}"
-        self.policy = torch.jit.load(str(POLICY_PATH)).eval()
+        self.checkpoint_path = Path(checkpoint_path).expanduser().resolve()
+        self.policy, self.checkpoint_update = load_checkpoint_policy(self.checkpoint_path, device)
+        self.device = next(self.policy.parameters()).device
+        print(f"[INFO] Loaded checkpoint: {self.checkpoint_path}")
+        print(f"[INFO] Checkpoint update: {self.checkpoint_update} (student + actor)")
+        print(f"[INFO] Policy device: {self.device}")
+        if self.device.type == "cuda":
+            print(f"[INFO] GPU: {torch.cuda.get_device_name(self.device)}")
+        print("[INFO] Physics: standard MuJoCo on CPU (200 Hz); policy inference: 50 Hz")
+        print(f"[INFO] Observation timing: {self.observation_timing}")
 
         # Cache joint indices
         self.qpos_idx = np.array([model.jnt_qposadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, j)] for j in JOINTS])
@@ -80,7 +73,7 @@ class MoeStairController:
         self.gyro_adr = model.sensor_adr[self.gyro_sensor_id] if self.gyro_sensor_id >= 0 else -1
 
         # Control state
-        self.kp = 20.0
+        self.kp = 18.0
         self.kd = 0.7
         self.previous_action = np.zeros(12, dtype=np.float32)
         self.target_q = STAND_Q.copy()
@@ -112,21 +105,32 @@ class MoeStairController:
         mujoco.mj_forward(self.model, self.data)
 
     def get_current_frame(self, command: tuple[float, float, float]) -> np.ndarray:
-        """Construct the 45-dim observation frame from current sensors."""
-        q = self.data.qpos[self.qpos_idx].astype(np.float32)
-        dq = self.data.qvel[self.qvel_idx].astype(np.float32)
+        """Select legacy readings or refresh derived sensors on copied state."""
+        if self.observation_timing == "fresh":
+            mujoco.mj_copyData(self.observation_data, self.model, self.data)
+            mujoco.mj_forward(self.model, self.observation_data)
+            return self._frame_from_data(self.observation_data, command)
+        return self.get_legacy_frame(command)
+
+    def get_legacy_frame(self, command: tuple[float, float, float]) -> np.ndarray:
+        """Original mixed-time readings, retained for comparisons and logging."""
+        return self._frame_from_data(self.data, command)
+
+    def _frame_from_data(self, data, command) -> np.ndarray:
+        q = data.qpos[self.qpos_idx].astype(np.float32)
+        dq = data.qvel[self.qvel_idx].astype(np.float32)
 
         # Base orientation & projected gravity
         # In MuJoCo xmat is 9 floats (row-major 3x3 rotation matrix from body to world)
-        rot = self.data.xmat[self.base_body_id].reshape(3, 3).astype(np.float32)
+        rot = data.xmat[self.base_body_id].reshape(3, 3).astype(np.float32)
         # World gravity is [0, 0, -1]. Projected gravity in body frame: rot.T @ [0, 0, -1]
         gravity_proj = rot.T @ np.array([0.0, 0.0, -1.0], dtype=np.float32)
 
         # Angular velocity from IMU sensor or estimated from body velocity
         if self.gyro_adr >= 0:
-            gyro = self.data.sensordata[self.gyro_adr:self.gyro_adr + 3].astype(np.float32)
+            gyro = data.sensordata[self.gyro_adr:self.gyro_adr + 3].astype(np.float32)
         else:
-            gyro = (rot.T @ self.data.cvel[self.base_body_id][:3]).astype(np.float32)
+            gyro = (rot.T @ data.cvel[self.base_body_id][:3]).astype(np.float32)
 
         cmd = np.array(command, dtype=np.float32)
 
@@ -160,10 +164,10 @@ class MoeStairController:
             self.history[:-1] = self.history[1:]
             self.history[-1] = frame
 
-        # Inference with TorchScript model expecting [1, 225] oldest-first
-        obs_tensor = torch.from_numpy(self.history.flatten()).unsqueeze(0)
-        with torch.no_grad():
-            raw_action = self.policy(obs_tensor).squeeze(0).numpy().astype(np.float32)
+        # Checkpoint student policy expects [1, 225] oldest-first.
+        obs_tensor = torch.from_numpy(self.history.flatten()).unsqueeze(0).to(self.device)
+        with torch.inference_mode():
+            raw_action = self.policy(obs_tensor).squeeze(0).cpu().numpy().astype(np.float32)
 
         if not np.all(np.isfinite(raw_action)):
             raw_action = np.zeros(12, dtype=np.float32)
