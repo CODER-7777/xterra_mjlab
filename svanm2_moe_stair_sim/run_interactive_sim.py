@@ -27,7 +27,20 @@ from checkpoint_policy import DEFAULT_CHECKPOINT
 from teleop import KeyboardTeleop, MAX_VX, MAX_VY, MAX_YAW
 
 
-def parse_args():
+def positive_finite(value):
+    value = float(value)
+    if not np.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("Contact impedance ratio must be positive and finite")
+    return value
+
+
+def configure_contact(model, impratio=None):
+    """Explicit simulation-only intervention; preserve the XML default if omitted."""
+    if impratio is not None:
+        model.opt.impratio = positive_finite(impratio)
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="SvanM2 MoE 90k Interactive Stair Simulation")
     parser.add_argument("--checkpoint-file", type=Path, default=DEFAULT_CHECKPOINT,
                         help="MoE-CTS training checkpoint (default: checkpoints/svanm2_moe/model_90000.pt)")
@@ -41,7 +54,9 @@ def parse_args():
     parser.add_argument("--observation-timing", choices=("legacy", "fresh"), default="legacy",
                         help="Legacy readings or consistent post-step readings refreshed on copied state")
     parser.add_argument("--log-dir", type=Path, help="Record to this new directory instead of an automatic timestamp")
-    return parser.parse_args()
+    parser.add_argument("--contact-impratio", type=positive_finite, default=None,
+                        help="Explicit MuJoCo contact experiment (10 reduced measured jitter); omitted uses scene.xml. Not a hardware parameter.")
+    return parser.parse_args(argv)
 
 
 def print_hud(info: dict, teleop: KeyboardTeleop, data: mujoco.MjData, tilt_deg: float, sim_time: float):
@@ -66,6 +81,8 @@ def main():
 
     print("[INFO] Loading MuJoCo model...")
     model = mujoco.MjModel.from_xml_path(str(scene_path))
+    configure_contact(model, args.contact_impratio)
+    print(f"[INFO] Active contact impratio: {model.opt.impratio:g}; physics timestep: {model.opt.timestep:g} s")
     data = mujoco.MjData(model)
 
     print("[INFO] Initializing MoE 90k Controller and Teleop...")

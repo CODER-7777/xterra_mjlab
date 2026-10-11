@@ -21,19 +21,22 @@ SCALE = np.tile([0.15, 0.15, 0.30], 4).astype(np.float32)
 TORQUE_LIMITS = np.tile([12.0, 12.0, 24.0], 4).astype(np.float32)
 GEAR = np.tile([8.0, 8.0, 16.0], 4).astype(np.float32)
 
-# Joint target boundaries for simulation: allows full forward stepping stride and stair climbing
+# Software position-target bounds; full per-joint deployment parity remains under review.
 TARGET_MIN = np.array([
-    -1.0472, -1.5708, -2.7227,  # FL
-    -1.0472, -1.5708, -2.7227,  # FR
-    -1.0472, -0.5236, -2.7227,  # RL
-    -1.0472, -0.5236, -2.7227   # RR
+    -0.7350, -1.5708, -2.7227,  # FL
+    -0.7350, -1.5708, -2.7227,  # FR
+    -0.7350, -0.5236, -2.7227,  # RL
+    -0.7350, -0.5236, -2.7227   # RR
 ], dtype=np.float32)
 
+# Important target-bound corrections from the recorded deployed-adapter audit:
+# calf upper -0.88776 rad, hip ±0.735 rad. These are commanded-position clamps,
+# not verified physical-stop angles or a hardware firmware change.
 TARGET_MAX = np.array([
-     1.0472,  3.4907, 0.5000,  # FL
-     1.0472,  3.4907, 0.5000,  # FR
-     1.0472,  4.5379, 0.5000,  # RL
-     1.0472,  4.5379, 0.5000   # RR
+     0.7350,  3.4907, -0.88776,  # FL
+     0.7350,  3.4907, -0.88776,  # FR
+     0.7350,  4.5379, -0.88776,  # RL
+     0.7350,  4.5379, -0.88776   # RR
 ], dtype=np.float32)
 
 # Belt coupling Jacobian (4 legs, 3x3 block diagonal)

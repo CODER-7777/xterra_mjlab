@@ -25,3 +25,5 @@ venv/
 # stray runtime logs
 MUJOCO_LOG.TXT
 .pytest_cache/
+evaluation_runs/
+*.swp

@@ -1,5 +1,17 @@
 # SvanM2 MoE 90,000 Multi-Stair Simulation
 
+## October 10 contact diagnostic
+
+For the current jitter diagnosis, evidence, and all tested outcomes, read
+[Task 3's detailed report](../../notes/23_DEEP_JITTER_ANALYSIS_20261010.md).
+The viewer accepts `--contact-impratio 10` for the measured simulation mitigation;
+omitting it retains the scene's value. Active solver options are saved when recording.
+Use `--device cpu` for CPU-only inference. No training is performed by the viewer.
+The setting reduced vibration in controlled tests but did not solve every stair case
+or validate a real-robot fix. Discuss training/GPU use with the user before launching it.
+
+
+
 Interactive MuJoCo simulation environment for the **xTerra SvanM2** quadruped robot driven by the **MoE-CTS 90,000-update student policy**, loaded directly from `checkpoints/svanm2_moe/model_90000.pt`.
 
 ---

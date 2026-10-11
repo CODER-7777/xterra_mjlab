@@ -5,8 +5,7 @@ actuator past the knee to drive the calf, so the calf-motor angle depends on
 both the calf joint *and* the thigh joint. This actuator models that physical
 transmission in simulation: positions/velocities and torques are mapped through
 the per-leg Jacobian ``J_theta`` / ``J_theta.T``, and per-motor PD gains are
-derived from the joint-space cfg gains so the **effective joint stiffness equals
-the cfg value**::
+derived from the nominal joint-space cfg gains::
 
     motor_pos      = J_theta @ q                         # joint -> motor
     tau_motor      = kp_motor * (motor_pos_des - motor_pos)
@@ -15,9 +14,11 @@ the cfg value**::
     kp_motor[i]    = kp_joint[i] / gear_ratio[i]**2
     kd_motor[i]    = kd_joint[i] / gear_ratio[i]**2
 
-With this gain transform ``K_eff = J_theta.T @ diag(kp_motor) @ J_theta`` has
-diagonal ``gear**2 * kp_motor = kp_joint``, and the belt term gives the physical
-thigh<->calf off-diagonal coupling a plain joint-space PD would miss. There is
+The effective stiffness is ``K_eff = J_theta.T @ diag(kp_motor) @ J_theta``.
+With equal configured gains k and the default coupling it is
+``k * [[1,0,0], [0,1.25,0.5], [0,0.5,1]]``: the thigh diagonal is 1.25*k,
+and thigh/calf off-diagonal terms are 0.5*k. Thus configured gains are not
+independent effective joint gains. Damping has the same transformation. There is
 NO ``2*pi`` factor here — this driver is all-radians (the firmware's ``2*pi`` is
 a rad<->rev unit conversion for the motor driver that cancels on hardware).
 
