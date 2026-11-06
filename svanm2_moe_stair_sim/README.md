@@ -96,3 +96,36 @@ python run_interactive_sim.py --track 2 --top
 3. **Action Mapping**: $\text{target} = q_0 + [0.15, 0.15, 0.30] \times \text{clip}(\text{action}, -6, 6)$, clamped inside physical deployment joint limits with 0.05 rad buffer.
 4. **Actuator Model**: Coupled motor-space PD ($k_p=20, k_d=0.7$, gear $[8, 8, 16]$, belt coupling matrix $J$).
 5. **Loop Rates**: Physics at 200 Hz ($dt=0.005\text{ s}$), Policy at 50 Hz (decimation 4).
+
+## Standard evaluation battery
+
+`eval_svanm2_moe.sh` runs the policy headlessly on CPU. It follows the layout of interiit_xterra's `eval_hs_dhav1w.sh`, adapted to SvanM2. It runs two passes:
+
+1. **Flat command battery.** Forward, lateral and yaw sweeps on a floor-only copy of `scene.xml`. Each run is 10 s, and the first 3 s are discarded. Default commands are the viewer's teleop caps.
+2. **Stairs.** One run per track (1–6), from the approach pad, at 0.3 m/s for 30 s. Use `--stair-starts center minus plus` to repeat each track from the two offset starts used in note 23.
+
+```bash
+# from Task_3
+xterra_mjlab/svanm2_moe_stair_sim/eval_svanm2_moe.sh                       # full battery
+xterra_mjlab/svanm2_moe_stair_sim/eval_svanm2_moe.sh --no-stairs           # flat only
+xterra_mjlab/svanm2_moe_stair_sim/eval_svanm2_moe.sh --no-flat --tracks 6  # one stair track
+xterra_mjlab/svanm2_moe_stair_sim/eval_svanm2_moe.sh --contact-impratio 10 --label impratio10
+```
+
+Output goes to `tools/results/svanm2_eval/<checkpoint>_<label>/` and contains:
+
+- `runs.csv` has one row per run, with tracking, cost, torque and jitter metrics.
+- `summary.csv` aggregates the rows by axis or track.
+- `flat_battery.png` and `stairs.png` are the figures.
+- `manifest.json` records the checkpoint SHA-256, the impratio, the timing mode and the arguments.
+- `tensorboard/` holds scalars for each run.
+
+Jitter uses the same definitions as `tools/jitter_analysis/analyze.py`. Measured joint shaking is the Welch RMS over 8–30 Hz at 200 Hz. Requested target shaking is the Welch RMS over 8–20 Hz at 50 Hz. The stair traversal test is a first-pass screen. It checks foot position, lane, tilt and falls, but not the per-foot load and clearance checks from interiit_xterra.
+
+View the results with TensorBoard:
+
+```bash
+tools/launch_tensorboard.sh tools/results/svanm2_eval/<run folder>
+```
+
+Tests: `../.venv/bin/python -m unittest test_eval_svanm2 -v`.
